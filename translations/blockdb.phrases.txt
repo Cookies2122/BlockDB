@@ -1,0 +1,15 @@
+"Phrases"
+{
+    "Notify_Player"
+    {
+        "en"   "{DEFAULT}[{BLUE}BlockDB{DEFAULT}] Player: {LIGHTBLUE}%s"
+        "ru"   "{DEFAULT}[{BLUE}BlockDB{DEFAULT}] Игрок: {LIGHTBLUE}%s"
+        "ua"   "{DEFAULT}[{BLUE}BlockDB{DEFAULT}] Гравець: {LIGHTBLUE}%s"
+    }
+    "Notify_BanCount"
+    {
+        "en"   "{DEFAULT}[{BLUE}BlockDB{DEFAULT}] Active bans: {RED}%d"
+        "ru"   "{DEFAULT}[{BLUE}BlockDB{DEFAULT}] Активных банов: {RED}%d"
+        "ua"   "{DEFAULT}[{BLUE}BlockDB{DEFAULT}] Активних банів: {RED}%d"
+    }
+}
