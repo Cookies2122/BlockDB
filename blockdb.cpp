@@ -712,7 +712,7 @@ const char *BlockDB::GetLicense()
 
 const char *BlockDB::GetVersion()
 {
-    return "1.0.0";
+    return "1.0.1";
 }
 
 const char *BlockDB::GetDate()
