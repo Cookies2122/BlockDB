@@ -470,11 +470,12 @@ static void KickPlayer(int slot)
 static void NotifyAdmins(const std::string& playerName, int banCount)
 {
     if (!g_pUtils || !g_pPlayersApi) return;
+    if (!g_pAdminApi) return;
 
     auto sendAll = [](const char* line) {
         for (int i = 0; i < 64; ++i) {
             if (!g_pPlayersApi->IsConnected(i) || g_pPlayersApi->IsFakeClient(i)) continue;
-            if (g_pAdminApi && !g_pAdminApi->IsAdmin(i)) continue;
+            if (!g_pAdminApi->IsAdmin(i)) continue;
             g_pUtils->PrintToChat(i, "%s", line);
         }
     };
@@ -505,19 +506,26 @@ static void OnClientAuthorized(int iSlot, uint64 sid)
             LogFile("Player %llu blocked (reason='%s'), kicking",
                 (unsigned long long)sid, r.reason.c_str());
 
-        g_pUtils->NextFrame([iSlot, r]() {
+        g_pUtils->NextFrame([iSlot, sid, r]() {
             if (!g_pPlayersApi) return;
+            if (r.blocked) { KickPlayer(iSlot); return; }
+            if (r.notificationsCount <= 0) return;
 
-            std::string name = "Unknown";
-            if (g_pPlayersApi->IsConnected(iSlot)) {
+            g_pUtils->CreateTimer(2.0f, [iSlot, sid, r]() -> float {
+                if (!g_pPlayersApi || !g_pPlayersApi->IsConnected(iSlot)) return -1.0f;
+
+                std::string name;
                 const char* nm = g_pPlayersApi->GetPlayerName(iSlot);
-                if (nm && *nm) name = nm;
-            }
-
-            if (r.notificationsCount > 0) {
+                if (nm && *nm) {
+                    name = nm;
+                } else {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "%llu", (unsigned long long)sid);
+                    name = buf;
+                }
                 NotifyAdmins(name, r.notificationsCount);
-            }
-            if (r.blocked) KickPlayer(iSlot);
+                return -1.0f;
+            });
         });
     }).detach();
 }
