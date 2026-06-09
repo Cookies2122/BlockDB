@@ -530,18 +530,28 @@ static void OnClientAuthorized(int iSlot, uint64 sid)
     }).detach();
 }
 
-static void OnPlayerPunish(int iSlot, int iType, int iTime, const char* szReason, int)
+static void OnPlayerPunish(int iSlot, int iType, int iTime, const char* szReason, int iAdminID)
 {
     if (iType != RT_BAN) return;
+
     uint64 sid = g_pPlayersApi->GetSteamID64(iSlot);
     if (!sid) return;
+
     const char* nm = g_pPlayersApi->GetPlayerName(iSlot);
     const char* ip = g_pPlayersApi->GetIpAddress(iSlot);
+
+    uint64 adm_sid = iAdminID == -1 ? 0 : g_pPlayersApi->GetSteamID64(iSlot);
+    const char* adm_nm = iAdminID == -1 
+        ? "Console" 
+        : g_pPlayersApi->GetPlayerName(iAdminID);
+    
     CreateBan(sid,
               (nm && *nm) ? nm : "Unknown",
               (ip && *ip) ? ip : "",
               szReason ? szReason : "",
-              iTime);
+              iTime,
+              adm_sid,
+              adm_nm);
 }
 
 static void OnOfflinePlayerUnpunish(const char* szSteamID64, int iType, int)
@@ -678,7 +688,7 @@ void BlockDB::AllPluginsLoaded()
         engine->ServerCommand(c.c_str());
         return;
     }
-    g_pPlayersApi = (IPlayersApi*)g_SMAPI->MetaFactory(Players_INTERFACE, &ret, NULL);
+    g_pPlayersApi = (IPlayersApi*)g_SMAPI->MetaFactory(PLAYERS_INTERFACE, &ret, NULL);
     if (ret == META_IFACE_FAILED) {
         g_pUtils->ErrorLog("[BlockDB] Missing Players plugin"); return;
     }
@@ -712,7 +722,7 @@ const char *BlockDB::GetLicense()
 
 const char *BlockDB::GetVersion()
 {
-    return "1.0.1";
+    return "1.0.2";
 }
 
 const char *BlockDB::GetDate()
