@@ -540,7 +540,7 @@ static void OnPlayerPunish(int iSlot, int iType, int iTime, const char* szReason
     const char* nm = g_pPlayersApi->GetPlayerName(iSlot);
     const char* ip = g_pPlayersApi->GetIpAddress(iSlot);
 
-    uint64 adm_sid = iAdminID == -1 ? 0 : g_pPlayersApi->GetSteamID64(iSlot);
+    uint64 adm_sid = iAdminID == -1 ? 0 : g_pPlayersApi->GetSteamID64(iAdminID);
     const char* adm_nm = iAdminID == -1 
         ? "Console" 
         : g_pPlayersApi->GetPlayerName(iAdminID);
