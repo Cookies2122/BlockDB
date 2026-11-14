@@ -1,4 +1,3 @@
-# vim: set sts=2 ts=8 sw=2 tw=99 et ft=python:
 import os, sys
 
 def ResolveEnvPath(env, folder):
@@ -18,29 +17,34 @@ def ResolveEnvPath(env, folder):
   return None
 
 def ResolveMMSRoot():
-  prenormalized_path = None
-  if builder.options.mms_path:
-    prenormalized_path = builder.options.mms_path
-  else:
-    prenormalized_path = ResolveEnvPath('MMSOURCE112', 'mmsource-1.12')
-    if not prenormalized_path:
-      prenormalized_path = ResolveEnvPath('MMSOURCE111', 'mmsource-1.11')
-    if not prenormalized_path:
-      prenormalized_path = ResolveEnvPath('MMSOURCE110', 'mmsource-1.10')
-    if not prenormalized_path:
-      prenormalized_path = ResolveEnvPath('MMSOURCE_DEV', 'metamod-source')
-    if not prenormalized_path:
-      prenormalized_path = ResolveEnvPath('MMSOURCE_DEV', 'mmsource-central')
-  if not prenormalized_path or not os.path.isdir(prenormalized_path):
-    raise Exception('Could not find a source copy of Metamod:Source')
-  
-  return os.path.abspath(os.path.normpath(prenormalized_path))
+    prenormalized_path = None
 
+    if hasattr(builder.options, 'mms_path') and builder.options.mms_path:
+        prenormalized_path = builder.options.mms_path
+    else:
+        prenormalized_path = ResolveEnvPath('MMSOURCE112', 'metamod-source')
+        if not prenormalized_path:
+            prenormalized_path = ResolveEnvPath('MMSOURCE111', 'metamod-source')
+        if not prenormalized_path:
+            prenormalized_path = ResolveEnvPath('MMSOURCE110', 'metamod-source')
+        if not prenormalized_path:
+            prenormalized_path = ResolveEnvPath('MMSOURCE_DEV', 'metamod-source')
+
+    if not prenormalized_path or not os.path.isdir(prenormalized_path):
+        raise Exception('Could not find a source copy of Metamod:Source')
+
+    return os.path.abspath(os.path.normpath(prenormalized_path))
 mms_root = ResolveMMSRoot()
 
-if not builder.options.hl2sdk_manifests:
-  raise Exception('Could not find a source copy of HL2SDK manifests')
-hl2sdk_manifests = builder.options.hl2sdk_manifests
+hl2sdk_manifests = None
+
+if hasattr(builder.options, 'hl2sdk_manifests') and builder.options.hl2sdk_manifests:
+    hl2sdk_manifests = builder.options.hl2sdk_manifests
+else:
+    hl2sdk_manifests = ResolveEnvPath('HL2SDKMANIFESTS', 'hl2sdk-manifests')
+
+if not hl2sdk_manifests or not os.path.isdir(hl2sdk_manifests):
+    raise Exception('Could not find a source copy of HL2SDK manifests')
 
 SdkHelpers = builder.Eval(os.path.join(hl2sdk_manifests, 'SdkHelpers.ambuild'), {
   'Project': 'metamod'
@@ -56,12 +60,12 @@ class MMSPluginConfig(object):
     self.all_targets = []
     self.target_archs = set()
 
-    if builder.options.plugin_name is not None:
+    if hasattr(builder.options, 'plugin_name') and builder.options.plugin_name:
       self.plugin_name = builder.options.plugin_name
     else:
       self.plugin_name = 'blockdb'
 
-    if builder.options.plugin_alias is not None:
+    if hasattr(builder.options, 'plugin_alias') and builder.options.plugin_alias:
       self.plugin_alias = builder.options.plugin_alias
     else:
       self.plugin_alias = 'blockdb'
@@ -76,7 +80,6 @@ class MMSPluginConfig(object):
             cxx = builder.DetectCxx(target_arch = arch)
             self.target_archs.add(cxx.target.arch)
         except Exception as e:
-            # Error if archs were manually overridden.
             if builder.options.targets:
                 raise
             print('Skipping target {}: {}'.format(arch, e))
@@ -162,7 +165,6 @@ class MMSPluginConfig(object):
         else:
           cxx.cxxflags += ['-Wno-deprecated']
       
-      # Work around SDK warnings.
       if cxx.version >= 'clang-10.0':
         cxx.cflags += [
           '-Wno-implicit-int-float-conversion',
@@ -204,7 +206,6 @@ class MMSPluginConfig(object):
         'odbccp32.lib',
       ]
 
-    # Optimization
     if builder.options.opt == '1':
       cxx.defines += ['NDEBUG']
       if cxx.behavior == 'gcc':
@@ -213,7 +214,6 @@ class MMSPluginConfig(object):
         cxx.cflags += ['/Ox', '/Zo']
         cxx.linkflags += ['/OPT:ICF', '/OPT:REF']
 
-    # Debugging
     if builder.options.debug == '1':
       cxx.defines += ['DEBUG', '_DEBUG']
       if cxx.behavior == 'gcc':
@@ -221,14 +221,11 @@ class MMSPluginConfig(object):
       elif cxx.behavior == 'msvc':
         cxx.cflags += ['/Od', '/RTC1']
 
-    # Don't omit the frame pointer.
-    # This needs to be after our optimization flags which could otherwise disable it.
     if cxx.behavior == 'gcc':
       cxx.cflags += ['-fno-omit-frame-pointer']
     elif cxx.behavior == 'msvc':
       cxx.cflags += ['/Oy-']
 
-    # Platform-specifics
     if cxx.target.platform == 'linux':
       cxx.defines += ['LINUX', '_LINUX', 'POSIX', '_FILE_OFFSET_BITS=64']
       if cxx.family == 'gcc':
@@ -251,8 +248,13 @@ class MMSPluginConfig(object):
     cxx.cxxincludes += [
       os.path.join(context.currentSourcePath),
       os.path.join(mms_core_path),	
-      os.path.join(mms_core_path, 'sourcehook'),
     ]
+    khook_path = os.path.join(self.mms_root, 'third_party', 'khook', 'include')
+    if not os.path.isdir(khook_path):
+      raise Exception('Metamod:Source 2.0 (KHook) is required, not found: {0}'.format(khook_path))
+    cxx.cxxincludes += [khook_path]
+    if cxx.behavior == 'gcc':
+      cxx.cxxflags += ['-Wno-sign-compare', '-Wno-attributes']
 
     defines = []
     for other_sdk in self.sdk_manifests:
@@ -261,15 +263,13 @@ class MMSPluginConfig(object):
     cxx.defines += ['META_IS_SOURCE2']
     binary.sources += [
       os.path.join(sdk['path'], 'public', 'tier0', 'memoverride.cpp'),
-      os.path.join(sdk['path'], 'tier1', 'generichash.cpp'),
-      os.path.join(sdk['path'], 'entity2', 'entitysystem.cpp'),
-      os.path.join(sdk['path'], 'entity2', 'entityidentity.cpp'),
-      os.path.join(sdk['path'], 'entity2', 'entitykeyvalues.cpp'),
-      os.path.join(sdk['path'], 'tier1', 'convar.cpp'),
-      os.path.join(sdk['path'], 'tier1', 'keyvalues3.cpp'),
     ]
 
     SdkHelpers.configureCxx(context, binary, sdk)
+
+    static_libs = SdkHelpers.getLists(sdk, 'static_libs', binary.compiler)
+    if static_libs:
+      binary.compiler.postlink += ['-Wl,--start-group'] + [os.path.join(sdk['path'], lib) for lib in static_libs] + ['-Wl,--end-group']
 
     return binary
 

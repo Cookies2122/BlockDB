@@ -1,4 +1,3 @@
-# vim: set sts=2 ts=8 sw=2 tw=99 et:
 import sys
 try:
   from ambuild2 import run, util
@@ -12,7 +11,6 @@ except:
     sys.stderr.write('http://www.alliedmods.net/ambuild\n')
   sys.exit(1)
 
-# Hack to show a decent upgrade message, which wasn't done until 2.2.
 ambuild_version = getattr(run, 'CURRENT_API', '2.1')
 if ambuild_version.startswith('2.1'):
   sys.stderr.write("AMBuild 2.2 or higher is required; please update\n")

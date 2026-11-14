@@ -3,7 +3,6 @@
 
 #include <ISmmPlugin.h>
 #include <stdio.h>
-#include <sh_vector.h>
 #include "utlvector.h"
 #include "ehandle.h"
 #include <iserver.h>
@@ -23,6 +22,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <string>
+#include <map>
 #include <vector>
 #include <ctime>
 #include <cstring>
@@ -31,8 +31,9 @@
 #include <sys/types.h>
 #include "CCSPlayerController.h"
 #include "include/menus.h"
+#include "include/utils.h"
+#include "include/players.h"
 #include "include/admin.h"
-
 
 class BlockDB final : public ISmmPlugin, public IMetamodListener
 {
@@ -49,9 +50,6 @@ private:
 	const char* GetVersion();
 	const char* GetDate();
 	const char* GetLogTag();
-private:
-	void OnGameServerSteamAPIActivated();
-	void Authorization();
 };
 
-#endif //_INCLUDE_METAMOD_SOURCE_STUB_PLUGIN_H_
+#endif

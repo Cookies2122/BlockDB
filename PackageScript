@@ -1,4 +1,3 @@
-# vim: set ts=2 sw=2 tw=99 noet ft=python: 
 import os
 
 builder.SetBuildFolder('package')
@@ -14,8 +13,6 @@ for cxx in MMSPlugin.all_targets:
 
 pdb_list = []
 for task in MMSPlugin.binaries:
-  # This hardly assumes there's only 1 targetted platform and would be overwritten
-  # with whatever comes last if multiple are used!
   with open(os.path.join(builder.buildPath, MMSPlugin.plugin_name + '.vdf'), 'w') as fp:
     fp.write('"Metamod Plugin"\n')
     fp.write('{\n')

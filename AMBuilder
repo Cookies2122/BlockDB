@@ -1,4 +1,3 @@
-# vim: set sts=2 ts=8 sw=2 tw=99 et ft=python: 
 import os
 
 for sdk_target in MMSPlugin.sdk_targets:
@@ -19,8 +18,6 @@ for sdk_target in MMSPlugin.sdk_targets:
     os.path.join('..', 'SchemaEntity', 'schemasystem.cpp'),
   ]
 
-  if cxx.target.arch == 'x86':
-    binary.sources += ['sourcehook/sourcehook_hookmangen.cpp']
   nodes = builder.Add(binary)
   MMSPlugin.binaries += [nodes]
     

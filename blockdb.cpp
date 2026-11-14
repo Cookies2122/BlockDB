@@ -1,6 +1,13 @@
 #include "blockdb.h"
+#include <khook.hpp>
 
 using json = nlohmann::json;
+
+static std::string SafeDump(const json& j)
+{
+    try { return j.dump(-1, ' ', false, json::error_handler_t::replace); }
+    catch (...) { return "{}"; }
+}
 
 static void EnsureDirFor(const char* filepath)
 {
@@ -26,10 +33,12 @@ IAdminApi*   g_pAdminApi   = nullptr;
 
 ISteamHTTP* g_http = nullptr;
 
-SH_DECL_HOOK0_void(IServerGameDLL, GameServerSteamAPIActivated, SH_NOATTRIB, 0);
+KHook::Return<void> Hook_GameServerSteamAPIActivated(IServerGameDLL* pServer);
+KHook::Virtual<IServerGameDLL, void> g_hkGameServerSteamAPIActivated(&IServerGameDLL::GameServerSteamAPIActivated, &Hook_GameServerSteamAPIActivated, nullptr);
 
 static const char* kApiBase    = "https://api.blockdb.net";
 static const char* kKeyFile    = "addons/data/blockdb_data.ini";
+static const char* kBanIdFile  = "addons/data/blockdb_bans.ini";
 
 static std::string LogFilePath()
 {
@@ -197,8 +206,8 @@ static std::string GetServerHostname()
     if (g_pCVar) {
         ConVarRefAbstract var("hostname");
         if (var.IsValidRef()) {
-            const char* s = var.GetString();
-            if (s && *s) return s;
+            CUtlString s = var.GetString();
+            if (!s.IsEmpty()) return std::string(s.Get());
         }
     }
     return "Unknown Server";
@@ -240,16 +249,19 @@ static std::string GetServerPort()
     return buf;
 }
 
-class SyncHttpReq
+class AsyncHttpJob
 {
 public:
-    SyncHttpReq() : m_ready(false), m_status(0) {}
-    bool Run(EHTTPMethod method, const std::string& url,
-             const std::string& body,
-             const std::vector<std::pair<std::string,std::string>>& headers,
-             std::string& outBody, int& outStatus)
+    using Callback = std::function<void(bool ok, int status, const std::string& body)>;
+
+    static void Send(EHTTPMethod method, const std::string& url,
+                     const std::string& body,
+                     const std::vector<std::pair<std::string,std::string>>& headers,
+                     Callback cb)
     {
-        if (!g_http) return false;
+        if (!g_http) { if (cb) cb(false, 0, std::string()); return; }
+
+        auto* job = new AsyncHttpJob(std::move(cb));
         auto hReq = g_http->CreateHTTPRequest(method, url.c_str());
         g_http->SetHTTPRequestHeaderValue(hReq, "Content-Type", "application/json");
         for (auto& h : headers)
@@ -257,39 +269,45 @@ public:
         if (!body.empty())
             g_http->SetHTTPRequestRawPostBody(hReq, "application/json",
                 (uint8*)body.data(), (uint32)body.size());
-        SteamAPICall_t hCall;
-        g_http->SendHTTPRequest(hReq, &hCall);
-        m_cb.SetGameserverFlag();
-        m_cb.Set(hCall, this, &SyncHttpReq::OnDone);
-        std::unique_lock<std::mutex> lk(m_mtx);
-        m_cv.wait_for(lk, std::chrono::seconds(15), [this]{ return m_ready; });
-        outBody = m_body; outStatus = m_status;
-        return m_ready;
+
+        SteamAPICall_t hCall = 0;
+        if (!g_http->SendHTTPRequest(hReq, &hCall)) {
+            g_http->ReleaseHTTPRequest(hReq);
+            Callback c = std::move(job->m_cb);
+            delete job;
+            if (c) c(false, 0, std::string());
+            return;
+        }
+        job->m_call.SetGameserverFlag();
+        job->m_call.Set(hCall, job, &AsyncHttpJob::OnDone);
     }
+
 private:
+    explicit AsyncHttpJob(Callback cb) : m_cb(std::move(cb)) {}
+
     void OnDone(HTTPRequestCompleted_t* p, bool failed)
     {
+        bool ok = false; int status = 0; std::string resp;
         if (!failed && p) {
-            m_status = (int)p->m_eStatusCode;
+            ok = true;
+            status = (int)p->m_eStatusCode;
             uint32 size = 0;
             g_http->GetHTTPResponseBodySize(p->m_hRequest, &size);
             if (size > 0) {
                 std::vector<uint8> buf(size + 1, 0);
                 g_http->GetHTTPResponseBodyData(p->m_hRequest, buf.data(), size);
-                m_body.assign((char*)buf.data(), size);
+                resp.assign((char*)buf.data(), size);
             }
         }
         if (g_http && p) g_http->ReleaseHTTPRequest(p->m_hRequest);
-        {
-            std::lock_guard<std::mutex> lk(m_mtx);
-            m_ready = true;
-        }
-        m_cv.notify_one();
+
+        Callback cb = std::move(m_cb);
+        delete this;
+        if (cb) cb(ok, status, resp);
     }
-    bool m_ready; int m_status;
-    std::string m_body;
-    std::mutex m_mtx; std::condition_variable m_cv;
-    CCallResult<SyncHttpReq, HTTPRequestCompleted_t> m_cb;
+
+    Callback m_cb;
+    CCallResult<AsyncHttpJob, HTTPRequestCompleted_t> m_call;
 };
 
 static std::string Auth() { return std::string("Bearer ") + g_apiKey; }
@@ -308,36 +326,32 @@ static void DoPair(const std::string& code)
     LogFile("Pairing: hostname='%s' ip=%s port=%s code=%s ...",
         hostname.c_str(), ip.c_str(), port.c_str(), code.c_str());
 
-    std::thread([body]() {
-        SyncHttpReq req;
-        std::string resp; int status = 0;
-        if (!req.Run(k_EHTTPMethodPOST,
-                     std::string(kApiBase) + "/v1/projects/servers/pair",
-                     body.dump(), {}, resp, status)) {
-            LogErr("Pair: HTTP timeout");
-            return;
-        }
-        if (status != 200) {
-            const char* reason = "unknown";
-            if (status == 400) reason = "invalid body";
-            else if (status == 403) reason = "code invalid or expired (10 min)";
-            else if (status == 500) reason = "internal server error";
-            LogErr("Pair failed: HTTP %d (%s) response: %s",
-                   status, reason, resp.c_str());
-            return;
-        }
-        json j = json::parse(resp, nullptr, false);
-        if (j.is_discarded() || !j.contains("api_key") || !j["api_key"].is_string()) {
-            LogErr("Pair: response has no api_key: %s", resp.c_str());
-            return;
-        }
-        std::string key = j["api_key"].get<std::string>();
-        if (key.empty()) { LogErr("Pair: empty api_key"); return; }
+    AsyncHttpJob::Send(k_EHTTPMethodPOST,
+        std::string(kApiBase) + "/v1/projects/servers/pair",
+        SafeDump(body), {},
+        [](bool ok, int status, const std::string& resp) {
+            if (!ok) { LogErr("Pair: HTTP timeout"); return; }
+            if (status != 200) {
+                const char* reason = "unknown";
+                if (status == 400) reason = "invalid body";
+                else if (status == 403) reason = "code invalid or expired (10 min)";
+                else if (status == 500) reason = "internal server error";
+                LogErr("Pair failed: HTTP %d (%s) response: %s",
+                       status, reason, resp.c_str());
+                return;
+            }
+            json j = json::parse(resp, nullptr, false);
+            if (j.is_discarded() || !j.contains("api_key") || !j["api_key"].is_string()) {
+                LogErr("Pair: response has no api_key: %s", resp.c_str());
+                return;
+            }
+            std::string key = j["api_key"].get<std::string>();
+            if (key.empty()) { LogErr("Pair: empty api_key"); return; }
 
-        g_apiKey = key;
-        SaveApiKey(key);
-        LogBox(0, { "SERVER PAIRED OK", "BlockDB linked." });
-    }).detach();
+            g_apiKey = key;
+            SaveApiKey(key);
+            LogBox(0, { "SERVER PAIRED OK", "BlockDB linked." });
+        });
 }
 
 struct SubsCheckResult
@@ -347,10 +361,10 @@ struct SubsCheckResult
     int         notificationsCount = 0;
 };
 
-static SubsCheckResult CheckSubscriptions(uint64 sid, const std::string& ip)
+static void CheckSubscriptionsAsync(uint64 sid, const std::string& ip,
+                                    std::function<void(const SubsCheckResult&)> cb)
 {
-    SubsCheckResult r;
-    if (g_apiKey.empty() || !g_http) return r;
+    if (g_apiKey.empty() || !g_http) return;
 
     char url[512];
     if (!ip.empty()) {
@@ -363,30 +377,33 @@ static SubsCheckResult CheckSubscriptions(uint64 sid, const std::string& ip)
             kApiBase, (unsigned long long)sid);
     }
 
-    SyncHttpReq req;
-    std::string resp; int status = 0;
-    if (!req.Run(k_EHTTPMethodGET, url, "",
-                 {{"Authorization", Auth()}}, resp, status)) {
-        LogErr("SubsCheck %llu: HTTP timeout", (unsigned long long)sid);
-        return r;
-    }
-    if (status < 200 || status > 299) {
-        LogErr("SubsCheck %llu: HTTP %d response: %s",
-            (unsigned long long)sid, status, resp.c_str());
-        return r;
-    }
-    json j = json::parse(resp, nullptr, false);
-    if (j.is_discarded() || !j.is_object()) return r;
+    uint64 sidCopy = sid;
+    AsyncHttpJob::Send(k_EHTTPMethodGET, url, "",
+        {{"Authorization", Auth()}},
+        [sidCopy, cb](bool ok, int status, const std::string& resp) {
+            if (!ok) {
+                LogErr("SubsCheck %llu: HTTP timeout", (unsigned long long)sidCopy);
+                return;
+            }
+            if (status < 200 || status > 299) {
+                LogErr("SubsCheck %llu: HTTP %d response: %s",
+                    (unsigned long long)sidCopy, status, resp.c_str());
+                return;
+            }
+            json j = json::parse(resp, nullptr, false);
+            if (j.is_discarded() || !j.is_object()) return;
 
-    try {
-        if (j.contains("blocked") && j["blocked"].is_boolean())
-            r.blocked = j["blocked"].get<bool>();
-        if (j.contains("reason") && j["reason"].is_string())
-            r.reason = j["reason"].get<std::string>();
-        if (j.contains("notifications") && j["notifications"].is_array())
-            r.notificationsCount = (int)j["notifications"].size();
-    } catch (...) {}
-    return r;
+            SubsCheckResult r;
+            try {
+                if (j.contains("blocked") && j["blocked"].is_boolean())
+                    r.blocked = j["blocked"].get<bool>();
+                if (j.contains("reason") && j["reason"].is_string())
+                    r.reason = j["reason"].get<std::string>();
+                if (j.contains("notifications") && j["notifications"].is_array())
+                    r.notificationsCount = (int)j["notifications"].size();
+            } catch (...) {}
+            if (cb) cb(r);
+        });
 }
 
 static void LogApiResponse(const char* what, int status, const std::string& resp)
@@ -405,9 +422,38 @@ static void LogApiResponse(const char* what, int status, const std::string& resp
     LogErr("✗ %s: HTTP %d — %s", what, status, errText.c_str());
 }
 
+static std::map<uint64, std::string> g_BanIds;
+
+static void LoadBanIds()
+{
+    g_BanIds.clear();
+    KeyValues* kv = new KeyValues("BlockDB_Bans");
+    if (!kv->LoadFromFile(g_pFullFileSystem, kBanIdFile)) { kv->deleteThis(); return; }
+    for (KeyValues* p = kv->GetFirstValue(); p; p = p->GetNextValue()) {
+        uint64 sid = 0;
+        try { sid = std::stoull(p->GetName()); } catch (...) { continue; }
+        const char* v = p->GetString(nullptr, "");
+        if (sid && v && *v) g_BanIds[sid] = v;
+    }
+    kv->deleteThis();
+    LogFile("Loaded %d cached ban_id(s)", (int)g_BanIds.size());
+}
+
+static void SaveBanIds()
+{
+    EnsureDirFor(kBanIdFile);
+    KeyValues* kv = new KeyValues("BlockDB_Bans");
+    for (auto& [sid, id] : g_BanIds) {
+        char key[32]; snprintf(key, sizeof(key), "%llu", (unsigned long long)sid);
+        kv->SetString(key, id.c_str());
+    }
+    kv->SaveToFile(g_pFullFileSystem, kBanIdFile);
+    kv->deleteThis();
+}
+
 static void CreateBan(uint64 victimSid, const std::string& victimName,
                       const std::string& victimIp,
-                      const std::string& reason, int duration,
+                      const std::string& reason, int durationMinutes,
                       uint64 adminSidArg = 0,
                       const std::string& adminName = "Server")
 {
@@ -419,44 +465,81 @@ static void CreateBan(uint64 victimSid, const std::string& victimName,
     char adminSidStr[32];
     snprintf(adminSidStr, sizeof(adminSidStr), "%llu", (unsigned long long)adminSid);
 
+    const int durationSec = (durationMinutes > 0) ? durationMinutes * 60 : 0;
+
     json b = {
         {"admin", {{"name", adminName}, {"steamid64", adminSidStr}}},
         {"offender", {
             {"ip", victimIp},
             {"steam", {{"steamid64", sid}, {"name", victimName}}}
         }},
-        {"duration", duration},
+        {"duration", durationSec},
         {"reason",   reason}
     };
-    std::string body = b.dump();
-    LogFile("POST /v1/bans → victim=%llu admin=%llu dur=%d reason='%s'",
+    std::string body = SafeDump(b);
+    LogFile("POST /v1/public/bans → victim=%llu admin=%llu dur=%dmin (%dsec) reason='%s'",
         (unsigned long long)victimSid, (unsigned long long)adminSid,
-        duration, reason.c_str());
+        durationMinutes, durationSec, reason.c_str());
 
-    std::thread([body]() {
-        SyncHttpReq req;
-        std::string resp; int status = 0;
-        req.Run(k_EHTTPMethodPOST, std::string(kApiBase) + "/v1/bans",
-                body, {{"Authorization", Auth()}}, resp, status);
-        LogApiResponse("Create ban", status, resp);
-    }).detach();
+    AsyncHttpJob::Send(k_EHTTPMethodPOST, std::string(kApiBase) + "/v1/public/bans",
+        body, {{"Authorization", Auth()}},
+        [victimSid](bool ok, int status, const std::string& resp) {
+            if (!ok) { LogErr("Create ban: HTTP failed"); return; }
+            LogApiResponse("Create ban", status, resp);
+            if (status < 200 || status > 299) return;
+
+            json j = json::parse(resp, nullptr, false);
+            if (j.is_discarded() || !j.is_object()) return;
+
+            std::string banId;
+            for (const char* k : { "ban_id", "id", "uuid" }) {
+                if (j.contains(k) && j[k].is_string()) { banId = j[k].get<std::string>(); break; }
+            }
+            if (banId.empty() && j.contains("data") && j["data"].is_object()) {
+                const auto& d = j["data"];
+                for (const char* k : { "ban_id", "id", "uuid" }) {
+                    if (d.contains(k) && d[k].is_string()) { banId = d[k].get<std::string>(); break; }
+                }
+            }
+
+            if (!banId.empty()) {
+                g_BanIds[victimSid] = banId;
+                SaveBanIds();
+                LogFile("ban_id cached: %llu -> %s", (unsigned long long)victimSid, banId.c_str());
+            } else {
+                LogFile("ban_id not found in response (unban by SteamID will be unavailable)");
+            }
+        });
 }
 
 static void DoUnban(uint64 victimSid)
 {
     if (g_apiKey.empty()) { LogErr("DoUnban: no api_key (run db_pair)"); return; }
-    char sid[32]; snprintf(sid, sizeof(sid), "%llu", (unsigned long long)victimSid);
-    json b = {{"steamid64", sid}};
-    std::string body = b.dump();
-    LogFile("POST /v1/bans/unban → sid=%llu", (unsigned long long)victimSid);
 
-    std::thread([body]() {
-        SyncHttpReq req;
-        std::string resp; int status = 0;
-        req.Run(k_EHTTPMethodPOST, std::string(kApiBase) + "/v1/bans/unban",
-                body, {{"Authorization", Auth()}}, resp, status);
-        LogApiResponse("Unban", status, resp);
-    }).detach();
+    auto it = g_BanIds.find(victimSid);
+    if (it == g_BanIds.end() || it->second.empty()) {
+        LogErr("Unban %llu: ban_id unknown — снимите бан через панель BlockDB "
+               "(API v1 разбанивает только по ban_id)",
+               (unsigned long long)victimSid);
+        return;
+    }
+
+    const std::string banId = it->second;
+    json b = {{"ban_id", banId}};
+    std::string body = SafeDump(b);
+    LogFile("POST /v1/public/bans/unban → sid=%llu ban_id=%s",
+        (unsigned long long)victimSid, banId.c_str());
+
+    AsyncHttpJob::Send(k_EHTTPMethodPOST, std::string(kApiBase) + "/v1/public/bans/unban",
+        body, {{"Authorization", Auth()}},
+        [victimSid](bool ok, int status, const std::string& resp) {
+            if (!ok) { LogErr("Unban: HTTP failed"); return; }
+            LogApiResponse("Unban", status, resp);
+            if (status >= 200 && status <= 299) {
+                g_BanIds.erase(victimSid);
+                SaveBanIds();
+            }
+        });
 }
 
 static void KickPlayer(int slot)
@@ -500,58 +583,50 @@ static void OnClientAuthorized(int iSlot, uint64 sid)
     size_t colon = ip.find(':');
     if (colon != std::string::npos) ip.erase(colon);
 
-    std::thread([iSlot, sid, ip]() {
-        SubsCheckResult r = CheckSubscriptions(sid, ip);
-        if (r.blocked)
+    CheckSubscriptionsAsync(sid, ip, [iSlot, sid](const SubsCheckResult& r) {
+        if (!g_pPlayersApi) return;
+        if (!g_pPlayersApi->IsConnected(iSlot)) return;
+        if (g_pPlayersApi->GetSteamID64(iSlot) != sid) return;
+
+        if (r.blocked) {
             LogFile("Player %llu blocked (reason='%s'), kicking",
                 (unsigned long long)sid, r.reason.c_str());
+            KickPlayer(iSlot);
+            return;
+        }
+        if (r.notificationsCount <= 0) return;
 
-        g_pUtils->NextFrame([iSlot, sid, r]() {
-            if (!g_pPlayersApi) return;
-            if (r.blocked) { KickPlayer(iSlot); return; }
-            if (r.notificationsCount <= 0) return;
+        g_pUtils->CreateTimer(2.0f, [iSlot, sid, r]() -> float {
+            if (!g_pPlayersApi || !g_pPlayersApi->IsConnected(iSlot)) return -1.0f;
+            if (g_pPlayersApi->GetSteamID64(iSlot) != sid) return -1.0f;
 
-            g_pUtils->CreateTimer(2.0f, [iSlot, sid, r]() -> float {
-                if (!g_pPlayersApi || !g_pPlayersApi->IsConnected(iSlot)) return -1.0f;
-
-                std::string name;
-                const char* nm = g_pPlayersApi->GetPlayerName(iSlot);
-                if (nm && *nm) {
-                    name = nm;
-                } else {
-                    char buf[32];
-                    snprintf(buf, sizeof(buf), "%llu", (unsigned long long)sid);
-                    name = buf;
-                }
-                NotifyAdmins(name, r.notificationsCount);
-                return -1.0f;
-            });
+            std::string name;
+            const char* nm = g_pPlayersApi->GetPlayerName(iSlot);
+            if (nm && *nm) {
+                name = nm;
+            } else {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%llu", (unsigned long long)sid);
+                name = buf;
+            }
+            NotifyAdmins(name, r.notificationsCount);
+            return -1.0f;
         });
-    }).detach();
+    });
 }
 
-static void OnPlayerPunish(int iSlot, int iType, int iTime, const char* szReason, int iAdminID)
+static void OnPlayerPunish(int iSlot, int iType, int iTime, const char* szReason, int)
 {
     if (iType != RT_BAN) return;
-
     uint64 sid = g_pPlayersApi->GetSteamID64(iSlot);
     if (!sid) return;
-
     const char* nm = g_pPlayersApi->GetPlayerName(iSlot);
     const char* ip = g_pPlayersApi->GetIpAddress(iSlot);
-
-    uint64 adm_sid = iAdminID == -1 ? 0 : g_pPlayersApi->GetSteamID64(iAdminID);
-    const char* adm_nm = iAdminID == -1 
-        ? "Console" 
-        : g_pPlayersApi->GetPlayerName(iAdminID);
-    
     CreateBan(sid,
               (nm && *nm) ? nm : "Unknown",
               (ip && *ip) ? ip : "",
               szReason ? szReason : "",
-              iTime,
-              adm_sid,
-              adm_nm);
+              iTime);
 }
 
 static void OnOfflinePlayerUnpunish(const char* szSteamID64, int iType, int)
@@ -602,7 +677,7 @@ BLOCKDB_EXPORT void BlockDB_RelayBan(const char* victimSidStr,
     std::string aName = (adminName && *adminName) ? adminName : "Console";
     std::string rsn   = reason ? reason : "";
 
-    LogFile("Iks_Admin ban relayed: victim=%llu admin=%llu dur=%d reason='%s'",
+    LogFile("Admin System ban relayed: victim=%llu admin=%llu dur=%d reason='%s'",
         (unsigned long long)vsid, (unsigned long long)asid,
         durationMinutes, rsn.c_str());
     CreateBan(vsid, vName, vIp, rsn, durationMinutes, asid, aName);
@@ -614,13 +689,8 @@ BLOCKDB_EXPORT void BlockDB_RelayUnban(const char* victimSidStr)
     uint64 sid = 0;
     try { sid = std::stoull(victimSidStr); } catch (...) { return; }
     if (!sid) return;
-    LogFile("Iks_Admin unban relayed: sid=%llu", (unsigned long long)sid);
+    LogFile("Admin System unban relayed: sid=%llu", (unsigned long long)sid);
     DoUnban(sid);
-}
-
-CGameEntitySystem* GameEntitySystem()
-{
-    return g_pUtils ? g_pUtils->GetCGameEntitySystem() : nullptr;
 }
 
 void StartupServer()
@@ -634,45 +704,57 @@ bool BlockDB::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool 
 {
     PLUGIN_SAVEVARS();
     GET_V_IFACE_CURRENT(GetEngineFactory, g_pCVar, ICvar, CVAR_INTERFACE_VERSION);
+    GET_V_IFACE_ANY(GetEngineFactory, g_pGameResourceServiceServer, IGameResourceService, GAMERESOURCESERVICESERVER_INTERFACE_VERSION);
     GET_V_IFACE_ANY    (GetEngineFactory, g_pSchemaSystem, ISchemaSystem, SCHEMASYSTEM_INTERFACE_VERSION);
     GET_V_IFACE_CURRENT(GetServerFactory, g_pSource2Server, ISource2Server, SOURCE2SERVER_INTERFACE_VERSION);
     GET_V_IFACE_CURRENT(GetEngineFactory, engine, IVEngineServer2, SOURCE2ENGINETOSERVER_INTERFACE_VERSION);
     GET_V_IFACE_CURRENT(GetFileSystemFactory, g_pFullFileSystem, IFileSystem, FILESYSTEM_INTERFACE_VERSION);
 
     g_SMAPI->AddListener(this, this);
-    SH_ADD_HOOK_MEMFUNC(IServerGameDLL, GameServerSteamAPIActivated, g_pSource2Server,
-        this, &BlockDB::OnGameServerSteamAPIActivated, false);
+    g_hkGameServerSteamAPIActivated.Add(g_pSource2Server);
 
     ConVar_Register(FCVAR_GAMEDLL | FCVAR_SERVER_CAN_EXECUTE |
                     FCVAR_CLIENT_CAN_EXECUTE | FCVAR_NOTIFY);
     return true;
 }
 
-void BlockDB::OnGameServerSteamAPIActivated()
+static int s_authAttempts = 0;
+static float BlockDB_AuthorizeTick()
 {
-    std::thread(&BlockDB::Authorization, this).detach();
-    RETURN_META(MRES_IGNORED);
+    if (!engine) return -1.0f;
+    if (engine->GetGameServerSteamID().GetStaticAccountKey()) {
+        g_http          = SteamGameServerHTTP();
+        g_serverSteamId = engine->GetGameServerSteamID().ConvertToUint64();
+        LogFile("SteamHTTP ready, server SteamID=%llu",
+            (unsigned long long)g_serverSteamId);
+        return -1.0f;
+    }
+    if (++s_authAttempts >= 300) {
+        LogErr("Authorization: gameserver SteamID not ready after 30s");
+        return -1.0f;
+    }
+    return 0.1f;
 }
 
-void BlockDB::Authorization()
+KHook::Return<void> Hook_GameServerSteamAPIActivated(IServerGameDLL* pServer)
 {
-    int attempts = 300;
-    while (--attempts) {
-        if (engine->GetGameServerSteamID().GetStaticAccountKey()) {
-            g_http          = SteamGameServerHTTP();
-            g_serverSteamId = engine->GetGameServerSteamID().ConvertToUint64();
-            LogFile("SteamHTTP ready, server SteamID=%llu",
-                (unsigned long long)g_serverSteamId);
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    g_http = SteamGameServerHTTP();
+    if (engine && engine->GetGameServerSteamID().GetStaticAccountKey()) {
+        g_serverSteamId = engine->GetGameServerSteamID().ConvertToUint64();
+        LogFile("SteamHTTP ready, server SteamID=%llu",
+            (unsigned long long)g_serverSteamId);
+    } else if (g_pUtils) {
+        s_authAttempts = 0;
+        g_pUtils->CreateTimer(0.1f, BlockDB_AuthorizeTick);
     }
+    return { KHook::Action::Ignore };
 }
 
 bool BlockDB::Unload(char* error, size_t maxlen)
 {
-    SH_REMOVE_HOOK_MEMFUNC(IServerGameDLL, GameServerSteamAPIActivated, g_pSource2Server,
-        this, &BlockDB::OnGameServerSteamAPIActivated, false);
+    int ret;
+    if (!g_SMAPI->MetaFactory(UTILS_INTERFACE, &ret, nullptr)) g_pUtils = nullptr;
+    g_hkGameServerSteamAPIActivated.Remove(g_pSource2Server);
     if (g_pUtils) g_pUtils->ClearAllHooks(g_PLID);
     ConVar_Unregister();
     return true;
@@ -681,7 +763,7 @@ bool BlockDB::Unload(char* error, size_t maxlen)
 void BlockDB::AllPluginsLoaded()
 {
     int ret;
-    g_pUtils = (IUtilsApi*)g_SMAPI->MetaFactory(Utils_INTERFACE, &ret, NULL);
+    g_pUtils = (IUtilsApi*)g_SMAPI->MetaFactory(UTILS_INTERFACE, &ret, NULL);
     if (ret == META_IFACE_FAILED) {
         ConColorMsg(Color(255,0,0,255), "[BlockDB] Missing Utils plugin\n");
         std::string c = "meta unload " + std::to_string(g_PLID);
@@ -706,6 +788,7 @@ void BlockDB::AllPluginsLoaded()
     }
 
     LoadApiKey();
+    LoadBanIds();
     LoadPhrases();
 
     if (!hasAdmin) {
@@ -722,7 +805,7 @@ const char *BlockDB::GetLicense()
 
 const char *BlockDB::GetVersion()
 {
-    return "1.0.2";
+    return "1.1.1";
 }
 
 const char *BlockDB::GetDate()
